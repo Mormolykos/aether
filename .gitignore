@@ -1,0 +1,13 @@
+# Build output
+/target
+*.pdb
+
+# Local configuration. Aether needs no credentials and `.env.example` carries every
+# value it reads, but a local file is where an operator position, a different feed, or
+# a tuning experiment ends up — none of which belong in a commit.
+.env
+
+# Run artefacts: the operator picture is written to stdout, so captured sessions land
+# here as ANSI-laden logs. Useful locally, noise in a repository.
+*.log
+*.err

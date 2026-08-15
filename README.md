@@ -27,6 +27,31 @@ Where something has not been measured, it says so.
 It does **not** contain targeting, engagement, weapon, or fire-control functionality of
 any kind, and is not intended to.
 
+## Where this problem shows up
+
+Aether is a worked instance of a problem shape rather than a product. The shape is:
+a stream of noisy, late, out-of-order position reports arrives from a sensor you do not
+own and cannot fix, and something downstream has to make a safety decision on it within
+a bounded time budget.
+
+That shape recurs across air traffic control and airspace deconfliction, satellite
+conjunction assessment, maritime collision avoidance (AIS in place of ADS-B, hours in
+place of minutes), UAS detect-and-avoid, and ground-vehicle sensor fusion. The pieces
+carry over more or less directly: geodetic-to-local-frame conversion, one filter per
+target, innovation gating against a physically motivated threshold, closed-form closest
+point of approach, lifecycle promotion and ageing driven by the age of the evidence
+rather than the clock, and a C ABI so the screening primitive can be called from an
+existing C or C++ stack without linking Rust into the hot path.
+
+ADS-B was chosen as the sensor because it is public, needs no credentials, and is
+genuinely awkward in the ways real sensor feeds are awkward — missing fields, string
+sentinels where a number belongs, positions of varying staleness, and the same
+observation re-served across polls. Everything reported below is reproducible from this
+repository against that live feed.
+
+Aether is not a certified system and makes no airworthiness, operational-safety or
+regulatory-compliance claim.
+
 ## Running it
 
 ```sh

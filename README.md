@@ -2,7 +2,7 @@
 
 A real-time aerospace telemetry engine in Rust: it ingests live ADS-B aircraft
 broadcasts, maintains a filtered track picture, and screens every pair of tracks for
-closest approach against ICAO separation minima.
+loss of separation against ICAO separation minima.
 
 Everything below is separated into **measured** results — numbers produced by running
 this code against the live feed — and **architectural** descriptions of how it works.
@@ -20,7 +20,8 @@ Where something has not been measured, it says so.
   constant-velocity Kalman filter per axis.
 - Rejects measurements that are kinematically implausible, and counts the rejections.
 - Ages tracks out on the staleness of their evidence.
-- Screens all firm pairs for closest point of approach, in closed form.
+- Screens all firm pairs for loss of separation over the look-ahead horizon, in closed
+  form, and reports each pair's closest point of approach alongside.
 - Exposes the closest-approach primitive over a C ABI for use from C or C++.
 - Bounds the memory a single upstream response can cause it to allocate.
 
@@ -200,23 +201,40 @@ visibly loses confidence in the `±m` column.
 
 ## Closest-approach screening
 
-Under a constant-velocity assumption the separation between two tracks is a quadratic in
-time, so the closest approach has a closed form and needs no search:
+Horizontal and vertical separation are judged separately, against 5 NM and 1000 ft by
+default, because that is how airspace is actually divided. An alert therefore answers one
+question: is there any instant in `[0, horizon]` at which the pair is inside **both**
+minima at once?
+
+Under a constant-velocity assumption each half has a closed form and needs no search.
+Vertical separation is linear in time, so it is inside its minimum on one open interval.
+Horizontal separation squared is a convex quadratic,
 
 ```text
-t_cpa = -(dp · dv) / (dv · dv)
+|dv_h|² t² + 2 (dp_h · dv_h) t + |dp_h|² − H² < 0
 ```
 
-clamped to `[0, horizon]`, because a closest approach in the past is not a warning. A
-cheap reject — can the pair reach the minima within the horizon even closing head-on? —
-keeps the O(n²) screen affordable. Both tracks are extrapolated to a common instant
-first; comparing two filters at the instants they happen to sit at is how phantom
+inside its minimum on the open interval between the roots, which are taken in the
+numerically stable form. The pair alerts when the two intervals overlap somewhere in
+`[0, horizon]`, and the start of the overlap is the time to loss of separation, shown as
+`LoS T-`. There is no approximate pre-filter in front: every rejection comes from the
+interval algebra. That algebra is exact under constant velocity, but it is evaluated in
+floating point, so a pair within rounding of a limit can land either side of it, and
+inputs far outside airspace scales can overflow the squared terms. Rejecting such inputs
+where they enter is not yet implemented. Both tracks are extrapolated to a common
+instant first; comparing two filters at the instants they happen to sit at is how phantom
 conflicts are created.
 
-Horizontal and vertical separation are judged separately, against 5 NM and 1000 ft by
-default, because that is how airspace is actually divided.
+Alerts are listed soonest loss of separation first. Distance at closest approach only
+orders pairs whose loss of separation begins at the same instant.
 
-A pair already inside the minima alerts at `t_cpa = 0` even while separating. Loss of
+The 3-D closest approach, `t_cpa = -(dp · dv) / (dv · dv)` clamped to `[0, horizon]`, is
+still shown for context, but it decides nothing. Metres of altitude and metres of range
+are not interchangeable against minima of 305 m and 9260 m: a pair level at 60 s and 9 km
+apart may have its 3-D closest approach at 149 s with 891 m between them vertically. It
+loses separation at 57 s, and that is when the screen says it does.
+
+A pair already inside the minima alerts at `LoS T-0` even while separating. Loss of
 separation now is still loss of separation.
 
 ## C ABI
@@ -230,6 +248,12 @@ typedef struct { double t_cpa, horiz_m, vert_m, closing_ms; } aether_cpa_t;
 int aether_cpa(const aether_state_t *a, const aether_state_t *b,
                double horizon_s, aether_cpa_t *out);
 ```
+
+It is a closest-approach primitive, not a separation verdict. Its `horiz_m` and `vert_m`
+are the separations at the instant of least 3-D distance, and a pair can be inside both
+minima at a different instant while being outside one of them at that one. A caller that
+decides loss of separation from these fields alone repeats exactly that error. Aether's
+own screen decides it from the violation intervals above.
 
 Rules held on that boundary: `#[repr(C)]` on everything that crosses it; every pointer
 null-checked before dereference; every input checked for finiteness; `out` untouched on
@@ -277,7 +301,7 @@ network hardening, and Aether has no inbound listener for such hardening to appl
 
 ## Verification
 
-### Tests — 55 passing
+### Tests — 59 passing
 
 These are properties held by construction and checked in CI-able unit tests, not
 observations of the live feed. Among them:
@@ -294,6 +318,17 @@ observations of the live feed. Among them:
 - Re-served and out-of-order measurements are superseded, not reapplied.
 - A gated plot still coasts its track.
 - Head-on conflicts are detected; vertically separated and receding traffic is not.
+- A pair inside both minima at any instant of the horizon alerts, including when its 3-D
+  closest approach lies outside the breach, and a pair inside both minima now alerts at
+  equal velocity.
+- Across 4,000 generated geometries — aimed at the cylinder's rim, at equal and barely
+  differing velocities, and at a zero horizon — the screen agrees with an oracle that
+  only samples positions every 0.05 s: every sampled breach is alerted, and at every
+  alert's onset the pair is on or within a micrometre of both minima, with no earlier
+  sampled instant inside both. A breach shorter than the sampling step is invisible to
+  that oracle.
+- An earlier loss of separation always ranks ahead of a later one, whatever the
+  distances.
 - Tracks last heard at different times are compared at a single instant.
 - The body accumulator never exceeds its bound, for chunk sizes from 1 byte to 64 KiB.
 - An oversized response is classified as oversized rather than as a transport error, and
@@ -388,7 +423,7 @@ real defence, and it requires a second sensor this project does not have.
   1000 ft regardless of airspace class, so low-altitude traffic near an aerodrome — where
   much smaller separations are normal and lawful — can raise alerts that a real system
   would suppress. No airspace model is implemented. This is a known false-positive source
-  and is not a defect in the closest-approach math.
+  and is not a defect in the separation math.
 - **The range column is ENU horizontal distance, not great-circle distance.** The two
   differ by about 0.06% at 463 km (462.3 km against 462.6 km). Not corrected.
 - **Altitude is barometric where the feed reports it**, falling back to geometric.

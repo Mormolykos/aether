@@ -49,6 +49,12 @@ pub struct AetherCpa {
 
 /// Closest point of approach between two constant-velocity states.
 ///
+/// A closest-approach primitive, not a separation verdict. `horiz_m` and `vert_m` are the
+/// separations at the instant of least 3-D distance; a pair can be inside both minima at
+/// another instant while outside one of them at this one. Deciding loss of separation
+/// from these fields alone repeats that error. `conjunction::pair_cpa` decides it from
+/// the violation intervals instead.
+///
 /// Returns `AETHER_OK` and fills `out` on success. `out` is untouched on any error.
 ///
 /// # Safety
@@ -77,8 +83,9 @@ pub unsafe extern "C" fn aether_cpa(
     AETHER_OK
 }
 
-/// The same closed form as `conjunction::pair_cpa`, on bare states. Kept as safe Rust
-/// so it can be unit tested without any unsafe block in the test.
+/// The same closed-form closest approach that `conjunction::pair_cpa` reports, on bare
+/// states. Kept as safe Rust so it can be unit tested without any unsafe block in the
+/// test.
 fn cpa(a: &AetherState, b: &AetherState, horizon_s: f64) -> Option<AetherCpa> {
     let (dpe, dpn, dpu) = (a.e - b.e, a.n - b.n, a.u - b.u);
     let (dve, dvn, dvu) = (a.ve - b.ve, a.vn - b.vn, a.vu - b.vu);

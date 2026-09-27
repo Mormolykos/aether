@@ -164,14 +164,17 @@ pub fn draw(
             alerts.len()
         );
         for c in alerts.iter().take(6) {
-            let colour = if c.t_cpa < 60.0 { RED } else { YELLOW };
+            let colour = if c.t_los < 60.0 { RED } else { YELLOW };
+            // Two instants on one row, each named: the loss of separation the alert is
+            // about, and the 3-D closest approach the separations are measured at.
             let _ = writeln!(
                 s,
-                "{colour}  T-{:>3.0}s  {:<9} <-> {:<9}  horiz {:>5.2} km  vert {:>4.0} m  \
-                 closing {:>3.0} kt  ±{:.0} m{RESET}",
-                c.t_cpa,
+                "{colour}  LoS T-{:>3.0}s  {:<9} <-> {:<9}  CPA T-{:>3.0}s horiz {:>5.2} km  \
+                 vert {:>4.0} m  closing {:>3.0} kt  ±{:.0} m{RESET}",
+                c.t_los,
                 truncate(&c.label_a, 9),
                 truncate(&c.label_b, 9),
+                c.t_cpa,
                 c.horiz_m / 1000.0,
                 c.vert_m,
                 c.closing_ms * crate::geo::MS_TO_KT,

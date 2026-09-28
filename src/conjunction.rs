@@ -48,7 +48,8 @@ pub struct Conjunction {
     /// is established; whether there is one does not depend on it.
     pub t_los: f64,
     /// Whether the breach is proven. `false` means the arithmetic could establish neither
-    /// answer, which happens only far outside the numerical envelope; the pair is reported
+    /// answer, which can happen at extreme scales such as a 1e-300 m minimum, inside the
+    /// accepted configuration; it does not mean the pair is safe. The pair is reported
     /// so that it is not silently dropped.
     pub resolved: bool,
     /// Seconds from now to the closest approach in three dimensions. Context only: it

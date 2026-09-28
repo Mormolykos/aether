@@ -276,10 +276,13 @@ pair is the sign of one polynomial.
 - **Every sign is proven.** It is first tried with arithmetic that carries a rigorous
   error bound. When that bound cannot settle it, the sign is computed exactly, as an
   unevaluated sum of doubles.
-- **A tangent stays a tangent.** It gives exactly zero, which is not a breach, in any
-  direction and at any scale.
-- **Only far outside the numerical envelope** can the exact arithmetic run out of range.
-  There, the pair is reported marked `?` rather than dropped.
+- **An exact tangent is never classified as a proven breach.** It gives exactly zero,
+  which is not a breach. At numerically unresolved scales it may produce an unresolved
+  `?` result.
+- **Unresolved results can occur even inside the accepted configuration domain,** at
+  extreme scales such as a 1e-300 m minimum. Such a pair is reported marked `?` rather
+  than dropped. `?` means the arithmetic could not prove breach or non-breach, not that
+  the pair is safe.
 - **Only the reported `LoS T-` time** is computed from the windows' ends, and it is within
   a rounding of the true instant.
 

@@ -11,9 +11,11 @@
 
 pub mod config;
 pub mod conjunction;
+pub mod domain;
 pub mod ffi;
 pub mod geo;
 pub mod ingest;
 pub mod kalman;
 pub mod render;
+mod robust;
 pub mod track;

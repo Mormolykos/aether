@@ -64,9 +64,18 @@ pub struct AdsbSensor {
 
 impl AdsbSensor {
     pub fn new(endpoint: String, period: Duration, max_body: usize) -> Result<Self> {
+        // An https endpoint stays https for every request the client makes, redirects
+        // included, so a redirect cannot quietly downgrade the transport the
+        // configuration asked for. The configuration refuses anything but https; a plain
+        // http endpoint reaches here only from a caller that built the sensor directly,
+        // such as the local test listener below.
+        let https = endpoint
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent("aether/0.1 (telemetry research)")
+            .https_only(https)
             .build()?;
         Ok(Self {
             client,
@@ -332,6 +341,42 @@ mod tests {
         );
         assert_eq!(sanitise_age(Some(f64::INFINITY)), 0.0);
         assert_eq!(sanitise_age(Some(1.0e9)), MAX_REPORTED_AGE_S);
+    }
+
+    #[test]
+    fn a_huge_finite_speed_from_the_feed_cannot_poison_a_track() {
+        // Audit regression, through the real decoder. `gs` passes as finite and
+        // non-negative, and 1e308 knots seeds a velocity that overflows once it is
+        // multiplied by the seconds between two polls.
+        use crate::geo::Frame;
+        use crate::track::TrackStore;
+        let record = |lat: f64| {
+            format!(
+                r#"{{"ac":[{{"hex":"f00001","alt_baro":30000,"gs":1e308,"track":90,
+                            "lat":{lat},"lon":23.7,"seen_pos":0.1}}]}}"#
+            )
+        };
+        let frame = Frame::new(Geodetic {
+            lat_deg: 37.9838,
+            lon_deg: 23.7275,
+            alt_m: 0.0,
+        });
+        let mut store = TrackStore::new(4.0, 900.0, 5.0);
+        let start = Instant::now();
+        store.ingest(&parse(&record(38.0)), &frame, start);
+        // 1e308 kt is 5.1e307 m/s, so any step over ~3.5 s overflows.
+        store.ingest(
+            &parse(&record(38.001)),
+            &frame,
+            start + Duration::from_secs(4),
+        );
+        let view = store
+            .get("f00001")
+            .expect("the plot itself is valid")
+            .view_at(start + Duration::from_secs(60));
+        for x in [view.pos.e, view.pos.n, view.pos.u, view.vel.e, view.vel.n] {
+            assert!(x.is_finite(), "{view:?}");
+        }
     }
 
     #[test]

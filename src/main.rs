@@ -93,13 +93,14 @@ async fn main() -> Result<()> {
     sensor_task.abort();
     println!(
         "\naether: {} cycles, {} plots, {} tracks initiated, {} dropped, {} gated, \
-         {} superseded, worst cycle {:.2} ms",
+         {} superseded, {} invalid, worst cycle {:.2} ms",
         cycles.count,
         cycles.contacts_in,
         store.total_initiated,
         store.total_dropped,
         store.total_gated,
         store.total_superseded,
+        store.total_invalid,
         cycles.worst.as_secs_f64() * 1000.0,
     );
     println!(

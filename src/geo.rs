@@ -160,6 +160,10 @@ pub struct Frame {
     sin_lon: f64,
     cos_lon: f64,
     pub site: Geodetic,
+    /// Whether `site` was inside the declared domain when the frame was built. Fixed at
+    /// construction, because every transform uses the origin computed then; changing
+    /// `site` afterwards changes neither.
+    valid: bool,
 }
 
 impl Frame {
@@ -173,7 +177,18 @@ impl Frame {
             sin_lon,
             cos_lon,
             site,
+            valid: crate::domain::geodetic(site).is_none(),
         }
+    }
+
+    /// Whether the site this frame was built on is a position the tracker accepts.
+    ///
+    /// Finite fields do not make a frame: a site 1e200 m above the ellipsoid, or at a
+    /// latitude of 1e10 degrees, transforms every contact into finite numbers that describe
+    /// no real geometry. `TrackStore::ingest` refuses to transform anything through a frame
+    /// for which this is false.
+    pub fn is_valid(&self) -> bool {
+        self.valid
     }
 
     pub fn to_enu(&self, p: Geodetic) -> Enu {

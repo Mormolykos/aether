@@ -64,6 +64,29 @@ Configuration is read from `.env` in the working directory, or from a path given
 first argument. It holds the observer position, poll and cycle periods, filter tuning,
 separation minima, and the response-body limit.
 
+Every value is checked against a declared domain before the HTTP client or the sensor is
+created. The Tokio runtime already exists by then. A value that does not parse as its type
+stops the load at that key. A file that parses but cannot be run on is refused with every
+offending key named at once, rather than panicking later or quietly switching a check
+off. Among the things refused are:
+
+- a zero poll or cycle period;
+- a negative, NaN or infinite horizon;
+- a NaN, zero or negative gate width;
+- negative process noise, or zero measurement variance;
+- a zero, negative or non-finite separation minimum;
+- a filter tuning, gate, minimum or horizon below the smallest normal double
+  (2.2250738585072014e-308), where a double no longer holds the value written;
+- an observer position off the globe;
+- a feed URL that does not parse, is not `https`, or has no host (`https://`,
+  `https:///v2/...`).
+
+Two of the refusals are **operating policy**, not correctness bounds: a body limit above
+64 MiB, which is a per-response ceiling and says nothing about total memory; and a poll or
+cycle period that is not shorter than the track timeout. Whether the endpoint resolves,
+answers or serves the expected JSON is a runtime fact, reported by the sensor-health line
+rather than predicted from the text of the URL.
+
 **Aether needs no credentials.** The ADS-B feed requires no API key, and there is nothing
 secret in `.env.example`. The real `.env` is still git-ignored — a local file is where a
 different observer position, an alternative feed, or a tuning experiment ends up, and
@@ -177,6 +200,17 @@ seeded from the reported ground speed and track where present, with a deliberate
 prior so that two updates overrule the seed. Process noise is the discretised
 continuous white-noise-acceleration form.
 
+The covariance is carried as its Cholesky factor `L`, with `P = L Lᵀ`, never as `P`
+itself: square-root filtering after Potter and Bierman, reduced to two states. The
+textbook update `P⁺ = (I − K H) P` subtracts nearly equal numbers when a measurement is
+far more precise than the prediction. With no process noise, a measurement variance of
+1e-20 m² and a 9 ms step, it produced a velocity variance of −2.9e-11 and a position
+variance of exactly 0; a variance of 1e-8 m² and a 60 s gap also give the zero. In
+factored form, the prediction re-triangularises `[F L | L_Q]` with Givens rotations, and
+the update scales the first column of `L` by `√R / √S`. Neither contains that
+subtraction, and `L Lᵀ` is symmetric and positive semidefinite for any finite `L`. At
+ordinary tunings a test holds it to the textbook filter's numbers, step by step.
+
 ## Measurement gating
 
 All three axes are evaluated before any is applied — a partially applied update from a
@@ -208,20 +242,48 @@ minima at once?
 
 Under a constant-velocity assumption each half has a closed form and needs no search.
 Vertical separation is linear in time, so it is inside its minimum on one open interval.
-Horizontal separation squared is a convex quadratic,
+Horizontal separation is judged along the relative track, a straight line. With relative
+speed `s = |dv_h|`, the pair sits at `a = dp_h · dv_h / s` along that line and
+`d = |dp_h × dv_h| / s` across it, and `d` is the closest the pair ever comes
+horizontally. If `d < H`, the pair is inside the minimum while `a + s·t` lies within the
+half-chord `w = √((H − d)(H + d))`, one open interval:
 
 ```text
-|dv_h|² t² + 2 (dp_h · dv_h) t + |dp_h|² − H² < 0
+( (−w − a) / s ,  (w − a) / s )
 ```
 
-inside its minimum on the open interval between the roots, which are taken in the
-numerically stable form. The pair alerts when the two intervals overlap somewhere in
-`[0, horizon]`, and the start of the overlap is the time to loss of separation, shown as
-`LoS T-`. There is no approximate pre-filter in front: every rejection comes from the
-interval algebra. That algebra is exact under constant velocity, but it is evaluated in
-floating point, so a pair within rounding of a limit can land either side of it, and
-inputs far outside airspace scales can overflow the squared terms. Rejecting such inputs
-where they enter is not yet implemented. Both tracks are extrapolated to a common
+No position, velocity or minimum is squared on its own. `s` comes from `hypot`, and `a`
+and `d` from the unit direction, whose components cannot exceed 1. When the product under
+the root is not a normal number, as for minima below about 1e-154, the two square roots
+are taken separately. Otherwise the product is used, because `√(x²)` rounds back to
+exactly `x`: a pair approaching along its line of centres enters at the exact instant.
+An earlier form solved the quadratic
+`|dv_h|² t² + 2 (dp_h · dv_h) t + |dp_h|² − H² < 0`. With a configured `H` of 1e-300 m,
+`H²` underflowed to 0, and two aircraft in exactly the same place were judged not inside
+the minimum.
+
+The pair alerts when the two intervals overlap somewhere in `[0, horizon]`, and the start
+of the overlap is the time to loss of separation, shown as `LoS T-`.
+
+Whether they overlap is not decided from the intervals' rounded ends. A window can be
+narrower than the spacing of doubles at the instant it happens. Against a 1e-15 m
+minimum, two aircraft passing exactly through each other 1 s from now are inside it for
+2e-17 s, and both rounded ends of that window are 1.0. The decision is taken instead
+from the signs of a few polynomials in the relative state, the minima and the horizon.
+Three intervals on a line share a point exactly when every two of them do, and each such
+pair is the sign of one polynomial.
+
+- **Every sign is proven.** It is first tried with arithmetic that carries a rigorous
+  error bound. When that bound cannot settle it, the sign is computed exactly, as an
+  unevaluated sum of doubles.
+- **A tangent stays a tangent.** It gives exactly zero, which is not a breach, in any
+  direction and at any scale.
+- **Only far outside the numerical envelope** can the exact arithmetic run out of range.
+  There, the pair is reported marked `?` rather than dropped.
+- **Only the reported `LoS T-` time** is computed from the windows' ends, and it is within
+  a rounding of the true instant.
+
+There is no approximate pre-filter in front. Both tracks are extrapolated to a common
 instant first; comparing two filters at the instants they happen to sit at is how phantom
 conflicts are created.
 
@@ -229,7 +291,10 @@ Alerts are listed soonest loss of separation first. Distance at closest approach
 orders pairs whose loss of separation begins at the same instant.
 
 The 3-D closest approach, `t_cpa = -(dp · dv) / (dv · dv)` clamped to `[0, horizon]`, is
-still shown for context, but it decides nothing. Metres of altitude and metres of range
+still shown for context, but it decides nothing. It is computed through the unit direction
+with no small-speed threshold: a threshold that treated a squared speed below 1e-9 as
+parallel reported a pair 1 m apart, closing at 1e-5 m/s, as already at its closest. The C
+ABI below calls the same function. Metres of altitude and metres of range
 are not interchangeable against minima of 305 m and 9260 m: a pair level at 60 s and 9 km
 apart may have its 3-D closest approach at 149 s with 891 m between them vertically. It
 loses separation at 57 s, and that is when the screen says it does.
@@ -245,6 +310,12 @@ separation now is still loss of separation.
 typedef struct { double e, n, u, ve, vn, vu; } aether_state_t;
 typedef struct { double t_cpa, horiz_m, vert_m, closing_ms; } aether_cpa_t;
 
+#define AETHER_OK         0
+#define AETHER_ERR_NULL  -1  /* a pointer was null */
+#define AETHER_ERR_NAN   -2  /* an input or the horizon was NaN, infinite or negative */
+#define AETHER_ERR_RANGE -3  /* a finite input exceeded 1e9 in magnitude, or the
+                                result could not be represented */
+
 int aether_cpa(const aether_state_t *a, const aether_state_t *b,
                double horizon_s, aether_cpa_t *out);
 ```
@@ -255,10 +326,23 @@ minima at a different instant while being outside one of them at that one. A cal
 decides loss of separation from these fields alone repeats exactly that error. Aether's
 own screen decides it from the violation intervals above.
 
-Rules held on that boundary: `#[repr(C)]` on everything that crosses it; every pointer
-null-checked before dereference; every input checked for finiteness; `out` untouched on
-any error path; no allocation across the boundary; and no panic, since unwinding across
-an FFI boundary is undefined behaviour. The math lives in a safe Rust function so it is
+Rules held on that boundary:
+
+- `#[repr(C)]` on everything that crosses it.
+- Every pointer is null-checked before dereference.
+- Every input is checked for finiteness and against the numerical envelope below: each of
+  the twelve components within ±1e9. The horizon must be finite and non-negative.
+- Every result is checked before it is written, so success carries four finite numbers
+  for any input inside that domain. Finite inputs alone did not guarantee that: two states
+  of order 1e200 overflowed the squared velocity. With the envelope in place the check is
+  defensive; no admitted input reaches it.
+- Finite is not the same as accurate. The result is the constant-velocity closest
+  approach evaluated in floating point, and, as above, not a separation verdict. It has
+  no small-speed threshold, and is tested at relative speeds from 1e-3 m/s down to the
+  smallest subnormal.
+- `out` is untouched on any error path.
+- No allocation crosses the boundary.
+- No panic, since unwinding across an FFI boundary is undefined behaviour. The math lives in a safe Rust function so it is
 unit-tested without an `unsafe` block.
 
 ## Input-boundary protection
@@ -266,7 +350,11 @@ unit-tested without an `unsafe` block.
 The ingestion client enforces a **configurable maximum response body of 8 MiB**
 (`MAX_BODY_BYTES`). **Measured** justification: three consecutive polls of the default
 endpoint returned 91,547 / 91,543 / 91,543 bytes, so the limit is roughly 90× observed
-steady state and cannot fire on legitimate traffic even at a much larger radius.
+steady state and cannot fire on legitimate traffic even at a much larger radius. The
+configuration refuses a limit above 64 MiB: a bound that can be configured away is not a
+bound. 64 MiB is an operating policy, not a derived safe maximum, and it bounds one
+response, not the process: parsed contacts, queued batches and tracks are held
+separately, and total memory is not bounded or measured here.
 
 Enforcement is in two places:
 
@@ -297,11 +385,72 @@ are three different problems.
 malformed upstream HTTP response. **What it does not:** anything else. It is not general
 network hardening, and Aether has no inbound listener for such hardening to apply to.
 
+## Numerical domain
+
+Checking that each input is finite does not keep the estimator finite. A ground speed of
+1e308 knots is finite, and so is the velocity it seeds, but multiplying that by four
+seconds is not. So values that enter from outside are checked against a declared domain
+(`src/domain.rs`) at three boundaries: a contact entering the tracker, together with the
+frame it is transformed through; the configuration file; and the C ABI.
+
+- **Contacts are checked at `TrackStore::ingest`**, the only way into the estimator. They
+  are not trusted from whichever adapter built them: `Contact` is public, and a library
+  caller need not have come through a decoder.
+  - Latitude, longitude, altitude and reported age must lie in their domains, or the plot
+    is refused and counted as invalid.
+  - A reported ground speed, track or vertical rate is converted to SI units and then
+    checked. Outside its domain it is treated as not reported, because the position beside
+    it is still good.
+- **The frame is checked too.** A `Frame` records when it is built whether its observer
+  position lies in the domain, and ingest refuses every contact transformed through one
+  that does not. A finite frame at an altitude of 1e200 m used to place tracks at
+  −1e200 m.
+- **A filter update is computed on copies and kept only if every state and covariance
+  term is finite and no velocity component exceeds 1e9 m/s.** Otherwise the plot is
+  refused as invalid and the track is left exactly as it was. That holds for the invalid
+  outcome only: a gated plot deliberately coasts its track, and gated and superseded plots
+  are counted.
+- **The gate is written so that only a finite sigma inside it passes**, and residuals
+  that are not numbers are refused before the gate on every track, young or firm. Under
+  the old form, "reject if sigma exceeds the gate", a NaN compared false and was
+  accepted.
+- **The covariance is valid by construction**, symmetric and positive semidefinite,
+  because it is carried as a Cholesky factor (see Kalman tracking).
+
+Each quantity has its own bound and its own reason, listed in `src/domain.rs`. Two kinds of
+number appear there:
+
+- **1e9 is a policy envelope**, applied to altitude, age, speed and climb components,
+  filter tuning, gate width, separation minima, horizon and the C ABI components, in each
+  one's SI unit. It is set far above the regional air picture Aether is built for and is
+  the same number in every unit only for simplicity. It is not a physical limit: a
+  measurement variance above 1e9 m², a sigma above 31.6 km, is not impossible, and this
+  demonstrator declines it. Velocity is bounded per axis, so a speed can exceed 1e9 m/s.
+- **The smallest normal double, about 2.2e-308, is a derived floor** for measurement
+  variance, gate width, separation minima, and non-zero process noise and horizon. Below
+  it a double holds fewer than 53 significant bits, so the value used is not the value
+  written, and a variance that small has no representable covariance even when its
+  factor does. Above it, the filter update and the horizontal interval are formed
+  without the squares and subtractions that failed at small values, and are tested down
+  to the floor. How small a minimum or gate is sensible is operating policy, and is not
+  decided here.
+
+What this does not do:
+
+- It does not bound intermediate arithmetic. A tuning of q = 4 with r = 1e-300, a
+  1e-150 s step and a 10 km residual give a candidate velocity near 1e154 m/s. The
+  commit check refuses it; it is still computed.
+- Transformed positions are not held to the envelope: an observer and a contact each
+  inside it can be about twice the envelope apart.
+- It is not a geometric operating domain: the envelope bounds magnitudes, not how far
+  from the observer the tangent-plane frame stays meaningful.
+- The Kalman filter type itself does not validate its inputs; the store is the boundary.
+
 ---
 
 ## Verification
 
-### Tests — 59 passing
+### Tests — 96 passing
 
 These are properties held by construction and checked in CI-able unit tests, not
 observations of the live feed. Among them:
@@ -336,6 +485,49 @@ observations of the live feed. Among them:
   serves 256 KiB with no `Content-Length`.
 - The C ABI rejects null pointers and non-finite inputs without dereferencing or
   propagating them.
+- The C ABI either succeeds with four finite numbers or fails without writing a byte of
+  the caller's output. This is checked with a bit-pattern sentinel across magnitudes up to
+  1e308 in every field and horizons up to `f64::MAX`, including the finite 1e200 states
+  whose squared velocity overflowed.
+- A pair 1 m apart closing at 1e-5 m/s has its closest approach at the end of a
+  100,000 s horizon, not now; the same holds at speeds down to 1e-12 m/s, and one
+  geometry scaled from 1e-100 down to the smallest subnormal gives the same answer.
+- The covariance stays valid in the case that broke the textbook update: no process
+  noise, a measurement variance of 1e-20 m², a 9 ms step. So it does across measurement
+  variances from 1e-8 m² to the smallest double, steps from a microsecond to a minute,
+  200 stationary updates each, and 60 generated runs of 2,000 noisy steps, where the
+  factor is checked after every step and the matrix wherever its entries are
+  representable. At ordinary tunings the filter reproduces the textbook filter's state
+  and covariance to 1e-9 relative.
+- After that very precise report, identical stationary reports are still accepted, and
+  the position uncertainty never reads zero.
+- Two tracks in exactly the same place breach any positive minimum, down to the smallest
+  subnormal, standing still, moving together or moving apart. The same holds through a
+  configuration that accepts such a minimum.
+- A breach narrower than the spacing of doubles is found: 100 m apart, closing at
+  100 m/s, against a 1e-15 m minimum. At that scale, a tangent is not a breach, and one
+  ulp outside is not a breach either. One ulp inside is.
+- Two windows both narrower than that spacing are told apart exactly. When their centres
+  are closer together than the spacing, they overlap or not by their widths alone.
+- A tangent in a direction whose unit vector no double holds exactly is still not a
+  breach.
+- Every decision is the same with the pair's order reversed.
+- The proven signs agree with exact integer arithmetic on 20,000 cases, tangencies
+  included, at scales from 2^-900 to 2^900.
+- In 40 generated runs, no track went non-finite. The runs mix ordinary plots with NaN,
+  infinities, `f64::MAX`, 1e200 and subnormals in every field. They come in through the
+  public ingest path, which bypasses the decoder, and every track is viewed up to a
+  million seconds on. That is evidence over this corpus, not a proof over every
+  sequence.
+- A plot whose arithmetic would produce a velocity beyond the envelope is refused. A
+  frame outside the domain lets no contact in, whether it is non-finite or finite (an
+  altitude of 1e200 m, a latitude of 1e10); the track is left untouched.
+- Every numeric configuration key is swept through NaN, infinities, zero, negatives and
+  extremes. Each value is either refused by name or runs the tracker and the screen
+  without a panic or a non-finite number. Subnormal tunings, minima and horizons are
+  refused; the smallest normal double and 1e-300 are accepted. Feed URLs that are plain
+  `http://`, `ftp://`, missing the colon, missing a host (`https://`, `https:///v2/...`)
+  or containing a space are refused by name.
 
 `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 
@@ -361,7 +553,7 @@ measurement with the arrival time makes every track appear permanently fresh. Th
 corrected build ages tracks out on the staleness of their evidence and consequently
 re-initiates more of them.
 
-### Live baseline — 90 seconds, after all changes
+### Live baseline — 90 seconds, measured before the September 2026 numerical changes
 
 118 tracks · 4,468 observations · 13 gated (0.29%) · 616 superseded · 39 polls ·
 2 HTTP errors · 0 oversized · 0 decode errors · mean cycle 0.08 ms · worst cycle 0.24 ms.
@@ -388,9 +580,9 @@ What is and is not protected:
 
 | concern | status |
 | ------- | ------ |
-| Upstream server identity, transport integrity | Protected by TLS (rustls) |
+| Upstream server identity, transport integrity | Protected by TLS (rustls). The configuration refuses a feed URL that does not parse as `https` with a host, and the client is built `https_only`, which in reqwest refuses any non-TLS hop, redirects included. A caller that builds the sensor directly can still give it `http` |
 | Unbounded memory from an oversized response | Protected by the body limit |
-| Non-finite values reaching the estimator | Rejected at the decode boundary and at the C ABI |
+| Values outside the numerical domain | Refused at the tracker's ingest, whoever the caller, together with the frame they are transformed through, and at the C ABI; a filter update is kept only if every result is finite and every velocity component within 1e9 m/s |
 | Implausible kinematics | Rejected by the innovation gate |
 | Duplicate / out-of-order observations | Detected and counted |
 | **Authenticity of an ADS-B observation** | **Not protected. See below.** |

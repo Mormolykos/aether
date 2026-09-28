@@ -21,9 +21,10 @@
 //! extrapolates a copy. That separation is what makes it safe to place a measurement in
 //! its own past relative to the display: the display never wrote to the filter.
 
+use crate::domain::{self, ENVELOPE};
 use crate::geo::{Enu, Frame, Geodetic};
 use crate::ingest::Contact;
-use crate::kalman::Kf1D;
+use crate::kalman::{Innovation, Kf1D};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -85,23 +86,35 @@ pub enum Outcome {
     Gated,
     /// Describes a moment the filter had already passed.
     Superseded,
+    /// Outside the declared domain, or would have left the estimate non-finite. The
+    /// track, if there is one, is left exactly as it was.
+    Invalid,
+}
+
+/// Whether a filter state may be kept: every term finite, and no velocity faster than
+/// the envelope. A state that fails this came from arithmetic, not from an aircraft, and
+/// keeping it would let the next extrapolation overflow.
+fn usable(filt: &[Kf1D; 3]) -> bool {
+    filt.iter().all(|f| f.is_finite() && f.v.abs() <= ENVELOPE)
 }
 
 impl Track {
-    fn new(c: &Contact, pos: Enu, received: Instant, q: f64, r: f64) -> Self {
+    /// A new track on its first plot, or `None` if the state it would start from is not
+    /// usable.
+    fn new(c: &Contact, pos: Enu, received: Instant, q: f64, r: f64) -> Option<Self> {
         // Seed velocity from the reported heading and ground speed when present. It is
-        // only a prior: the covariance is loose enough that two updates overrule it.
-        let (ve, vn) = match (c.gs_kt, c.track_deg) {
-            (Some(gs), Some(trk)) => {
-                let speed = gs * crate::geo::KT_TO_MS;
-                let rad = trk.to_radians();
-                (speed * rad.sin(), speed * rad.cos())
-            }
+        // only a prior: the covariance is loose enough that two updates overrule it. A
+        // reported value outside its domain is a value that was not reported.
+        let (ve, vn) = match (
+            domain::ground_speed_ms(c.gs_kt),
+            domain::bearing_rad(c.track_deg),
+        ) {
+            (Some(speed), Some(rad)) => (speed * rad.sin(), speed * rad.cos()),
             _ => (0.0, 0.0),
         };
-        let vu = c.vrate_fpm.unwrap_or(0.0) * crate::geo::FPM_TO_MS;
+        let vu = domain::climb_ms(c.vrate_fpm).unwrap_or(0.0);
 
-        Self {
+        let track = Self {
             id: c.id.clone(),
             label: c.label.clone(),
             kind: c.kind.clone(),
@@ -127,7 +140,8 @@ impl Track {
             rejected: 0,
             superseded: 0,
             last_nis: 0.0,
-        }
+        };
+        usable(&track.filt).then_some(track)
     }
 
     /// Seconds of coast between the observation the filter is valid for and `t`.
@@ -243,32 +257,53 @@ impl Track {
             return Outcome::Superseded;
         }
 
+        // Everything below works on copies, and the track takes a copy only once it is
+        // known to be usable. A plot that would leave the estimate non-finite therefore
+        // leaves it exactly as it was, as if the plot had never arrived.
+        let mut coasted = self.filt;
+        for f in &mut coasted {
+            f.predict(dt);
+        }
+        let innovs = [
+            coasted[0].innovation(pos.e),
+            coasted[1].innovation(pos.n),
+            coasted[2].innovation(pos.u),
+        ];
+        // Checked before the gate and whatever the track's maturity. The gate asks
+        // whether a residual is too large, and a NaN is never too large: it has to be
+        // refused for being unusable, not left to fail a comparison it cannot fail.
+        if !usable(&coasted) || !innovs.iter().all(Innovation::is_usable) {
+            return Outcome::Invalid;
+        }
+
         // Coasting to the measurement's own moment is correct whether or not the
         // measurement survives the gate, so the validity time moves first and stays
         // moved. A gated plot leaves a coasted track, which is what it should leave.
-        for f in &mut self.filt {
-            f.predict(dt);
-        }
-        self.valid_rx = received;
-        self.valid_age = c.age_s;
-
+        //
         // Gate on all three axes before touching any of them: a partially applied
-        // update on a bad plot is worse than a rejected one.
-        let innovs = [
-            self.filt[0].innovation(pos.e),
-            self.filt[1].innovation(pos.n),
-            self.filt[2].innovation(pos.u),
-        ];
-        if self.is_firm() && innovs.iter().any(|i| i.sigma() > gate_sigma) {
+        // update on a bad plot is worse than a rejected one. Written so that only a
+        // sigma inside the gate passes, rather than so that one outside it fails.
+        if self.is_firm() && !innovs.iter().all(|i| i.sigma() <= gate_sigma) {
+            self.filt = coasted;
+            self.valid_rx = received;
+            self.valid_age = c.age_s;
             self.rejected += 1;
             return Outcome::Gated;
         }
 
-        self.filt[0].update(pos.e);
-        self.filt[1].update(pos.n);
-        self.filt[2].update(pos.u);
+        let mut updated = coasted;
+        for (f, z) in updated.iter_mut().zip([pos.e, pos.n, pos.u]) {
+            f.update(z);
+        }
+        let nis = innovs.iter().map(|i| i.nis()).sum::<f64>() / 3.0;
+        if !usable(&updated) || !nis.is_finite() {
+            return Outcome::Invalid;
+        }
 
-        self.last_nis = innovs.iter().map(|i| i.nis()).sum::<f64>() / 3.0;
+        self.filt = updated;
+        self.valid_rx = received;
+        self.valid_age = c.age_s;
+        self.last_nis = nis;
         self.updates += 1;
         self.accept_rx = received;
         self.accept_age = c.age_s;
@@ -290,6 +325,8 @@ pub struct IngestReport {
     pub updated: usize,
     pub gated: usize,
     pub superseded: usize,
+    /// Refused as outside the declared domain or numerically unusable.
+    pub invalid: usize,
 }
 
 pub struct TrackStore {
@@ -301,11 +338,28 @@ pub struct TrackStore {
     pub total_dropped: u64,
     pub total_gated: u64,
     pub total_superseded: u64,
+    pub total_invalid: u64,
 }
 
 impl TrackStore {
-    pub fn new(process_noise: f64, meas_var: f64, gate_sigma: f64) -> Self {
-        Self {
+    /// A store with the given filter tuning, or the reasons that tuning is unusable.
+    pub fn try_new(process_noise: f64, meas_var: f64, gate_sigma: f64) -> Result<Self, String> {
+        let bad: Vec<String> = [
+            (
+                "process noise",
+                process_noise,
+                domain::process_noise(process_noise),
+            ),
+            ("measurement variance", meas_var, domain::meas_var(meas_var)),
+            ("gate sigma", gate_sigma, domain::gate_sigma(gate_sigma)),
+        ]
+        .into_iter()
+        .filter_map(|(name, v, why)| why.map(|w| format!("{name} {v}: {w}")))
+        .collect();
+        if !bad.is_empty() {
+            return Err(bad.join("; "));
+        }
+        Ok(Self {
             tracks: HashMap::new(),
             q: process_noise,
             r: meas_var,
@@ -314,7 +368,19 @@ impl TrackStore {
             total_dropped: 0,
             total_gated: 0,
             total_superseded: 0,
-        }
+            total_invalid: 0,
+        })
+    }
+
+    /// As [`TrackStore::try_new`].
+    ///
+    /// # Panics
+    /// If the tuning is unusable. The configuration is validated before a store is ever
+    /// built, so in the application this is unreachable; for a library caller it refuses
+    /// at construction rather than producing a store whose gate is silently disabled.
+    pub fn new(process_noise: f64, meas_var: f64, gate_sigma: f64) -> Self {
+        Self::try_new(process_noise, meas_var, gate_sigma)
+            .unwrap_or_else(|e| panic!("unusable filter tuning: {e}"))
     }
 
     pub fn len(&self) -> usize {
@@ -342,14 +408,24 @@ impl TrackStore {
         received: Instant,
     ) -> IngestReport {
         let mut report = IngestReport::default();
+        // A position is the product of a contact and a frame, so both are checked here,
+        // at the only door into the estimator, rather than trusted from whoever built
+        // them: `Contact`, `Frame` and this method are all public.
+        let frame_ok = frame.is_valid();
         for c in contacts {
-            let pos = frame.to_enu(c.geo);
-            let outcome = match self.tracks.get_mut(&c.id) {
-                Some(track) => track.update(c, pos, received, self.gate_sigma),
-                None => {
-                    self.tracks
-                        .insert(c.id.clone(), Track::new(c, pos, received, self.q, self.r));
-                    Outcome::Initiated
+            let outcome = if !frame_ok || domain::contact(c).is_some() {
+                Outcome::Invalid
+            } else {
+                let pos = frame.to_enu(c.geo);
+                match self.tracks.get_mut(&c.id) {
+                    Some(track) => track.update(c, pos, received, self.gate_sigma),
+                    None => match Track::new(c, pos, received, self.q, self.r) {
+                        Some(track) => {
+                            self.tracks.insert(c.id.clone(), track);
+                            Outcome::Initiated
+                        }
+                        None => Outcome::Invalid,
+                    },
                 }
             };
             match outcome {
@@ -365,6 +441,10 @@ impl TrackStore {
                 Outcome::Superseded => {
                     report.superseded += 1;
                     self.total_superseded += 1;
+                }
+                Outcome::Invalid => {
+                    report.invalid += 1;
+                    self.total_invalid += 1;
                 }
             }
         }
@@ -708,6 +788,445 @@ mod tests {
             0.0,
             "the gated plot should still have advanced the validity time to its own moment"
         );
+    }
+
+    // --- numerical domain (audit finding 7) ------------------------------------------
+
+    /// Every number a track holds, and every number its view hands the screen, is finite.
+    fn finite_at(t: &Track, at: Instant) -> bool {
+        let v = t.view_at(at);
+        let fin = |p: Enu| p.e.is_finite() && p.n.is_finite() && p.u.is_finite();
+        fin(t.position())
+            && fin(t.velocity())
+            && fin(v.pos)
+            && fin(v.vel)
+            && v.pos_sigma.is_finite()
+            && t.pos_sigma().is_finite()
+            && t.last_nis.is_finite()
+    }
+
+    #[test]
+    fn a_huge_finite_ground_speed_cannot_make_the_estimator_non_finite() {
+        // Audit regression. A finite ground speed near 1e308 seeds a finite velocity,
+        // and multiplying that by a few seconds overflows.
+        let mut store = TrackStore::new(4.0, 900.0, 5.0);
+        let f = frame();
+        let start = Instant::now();
+        let fast = |lat: f64| Contact {
+            gs_kt: Some(1e308),
+            ..contact("hhh", lat, 23.7, 10_000.0)
+        };
+        store.ingest(&[fast(38.0)], &f, start);
+        store.ingest(&[fast(38.001)], &f, start + Duration::from_secs(4));
+        for t in store.iter() {
+            assert!(finite_at(t, start + Duration::from_secs(10)), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_finite_plot_is_refused_not_absorbed() {
+        // Audit regression. The gate asked `sigma > gate`, and NaN compares false, so a
+        // NaN innovation passed it. The gate also only runs on firm tracks, so a young
+        // track took NaN without being asked at all.
+        let mut store = TrackStore::new(4.0, 900.0, 5.0);
+        let f = frame();
+        let start = Instant::now();
+        for step in 0..10 {
+            store.ingest(
+                &[contact("firm", 38.0, 23.7, 10_000.0)],
+                &f,
+                start + Duration::from_secs(step),
+            );
+        }
+        // One plot: a track too young to be gated at all.
+        store.ingest(
+            &[contact("new", 38.2, 23.7, 10_000.0)],
+            &f,
+            start + Duration::from_secs(9),
+        );
+        let held: Vec<(Enu, u64)> = ["firm", "new"]
+            .iter()
+            .map(|id| {
+                (
+                    store.get(id).unwrap().position(),
+                    store.get(id).unwrap().updates,
+                )
+            })
+            .collect();
+
+        let at = start + Duration::from_secs(11);
+        store.ingest(
+            &[
+                contact("firm", 38.0, 23.7, f64::NAN),
+                contact("new", 38.2, 23.7, f64::NAN),
+            ],
+            &f,
+            at,
+        );
+        for (id, (pos, updates)) in ["firm", "new"].iter().zip(held) {
+            let t = store.get(id).unwrap();
+            assert!(finite_at(t, at), "{id}: {t:?}");
+            assert_eq!(t.position(), pos, "{id}: the plot moved the estimate");
+            assert_eq!(t.updates, updates, "{id}: the plot counted as evidence");
+        }
+    }
+
+    /// A deterministic generator, so a failing case can be named and replayed.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn unit(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.unit()
+        }
+        fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+            xs[((self.unit() * xs.len() as f64) as usize).min(xs.len() - 1)]
+        }
+    }
+
+    /// Values a hostile or broken producer can put in any numeric field.
+    const HOSTILE: [f64; 16] = [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::MAX,
+        -f64::MAX,
+        1e308,
+        -1e308,
+        1e200,
+        -1e200,
+        1e20,
+        -1e20,
+        1e-300,
+        f64::MIN_POSITIVE,
+        5e-324,
+        -0.0,
+        -1.0,
+    ];
+
+    #[test]
+    fn no_contact_sequence_can_make_a_track_non_finite() {
+        // The property rather than the cases: any mix of ordinary and hostile fields,
+        // arriving in any order, through the public ingest path that bypasses the
+        // decoder. After every batch, every track and every view the screen could take
+        // of it, now or long after, is finite.
+        let f = frame();
+        let start = Instant::now();
+        let mut rng = Lcg(0xae7e);
+        let (mut refused, mut initiated) = (0, 0);
+        for run in 0..40 {
+            let mut store = TrackStore::new(4.0, 900.0, 5.0);
+            let mut at = start;
+            for step in 0..60 {
+                at += Duration::from_millis((rng.range(0.0, 3000.0)) as u64);
+                let batch: Vec<Contact> = (0..4)
+                    .map(|k| {
+                        let mut c = Contact {
+                            gs_kt: Some(rng.range(0.0, 600.0)),
+                            track_deg: Some(rng.range(0.0, 360.0)),
+                            vrate_fpm: Some(rng.range(-3000.0, 3000.0)),
+                            age_s: rng.range(0.0, 10.0),
+                            ..contact(
+                                ["p", "q", "r", "s"][k],
+                                rng.range(37.5, 38.5),
+                                rng.range(23.0, 24.5),
+                                rng.range(0.0, 12_000.0),
+                            )
+                        };
+                        // Roughly one contact in four carries at least one bad field.
+                        if rng.unit() < 0.25 {
+                            let bad = rng.pick(&HOSTILE);
+                            match (rng.unit() * 7.0) as u32 {
+                                0 => c.geo.lat_deg = bad,
+                                1 => c.geo.lon_deg = bad,
+                                2 => c.geo.alt_m = bad,
+                                3 => c.gs_kt = Some(bad),
+                                4 => c.track_deg = Some(bad),
+                                5 => c.vrate_fpm = Some(bad),
+                                _ => c.age_s = bad,
+                            }
+                        }
+                        c
+                    })
+                    .collect();
+                store.ingest(&batch, &f, at);
+
+                for t in store.iter() {
+                    for later in [0, 60, 3_600, 1_000_000] {
+                        let when = at + Duration::from_secs(later);
+                        assert!(
+                            finite_at(t, when),
+                            "run {run} step {step}, viewed {later} s on: {t:?}"
+                        );
+                    }
+                    let v = t.velocity();
+                    assert!(
+                        [v.e, v.n, v.u].iter().all(|x| x.abs() <= ENVELOPE),
+                        "run {run} step {step}: velocity beyond the envelope: {t:?}"
+                    );
+                }
+            }
+            refused += store.total_invalid;
+            initiated += store.total_initiated;
+        }
+        // Neither half may be vacuous: hostile plots were actually refused, and
+        // ordinary ones actually made tracks.
+        assert!(
+            refused > 100 && initiated > 100,
+            "refused {refused}, initiated {initiated}"
+        );
+    }
+
+    #[test]
+    fn stationary_reports_stay_usable_after_a_very_precise_one() {
+        // Audit regression, the exact case, through the store. The subtractive covariance
+        // update committed a negative velocity variance, after which every identical
+        // stationary report was refused as Invalid and the view showed zero uncertainty.
+        let origin = Geodetic {
+            lat_deg: 0.0,
+            lon_deg: 0.0,
+            alt_m: 0.0,
+        };
+        let f = Frame::new(origin);
+        let still = Contact {
+            gs_kt: None,
+            track_deg: None,
+            vrate_fpm: None,
+            ..contact("still", 0.0, 0.0, 0.0)
+        };
+        let mut store = TrackStore::new(0.0, 1e-20, 5.0);
+        let at = Instant::now();
+        store.ingest(std::slice::from_ref(&still), &f, at);
+        assert_eq!(
+            store
+                .ingest(
+                    std::slice::from_ref(&still),
+                    &f,
+                    at + Duration::from_millis(9)
+                )
+                .updated,
+            1
+        );
+        for s in 1..=5 {
+            let when = at + Duration::from_secs(s);
+            let report = store.ingest(std::slice::from_ref(&still), &f, when);
+            assert_eq!(report.updated, 1, "second {s}: {report:?}");
+            let v = store
+                .get("still")
+                .unwrap()
+                .view_at(when + Duration::from_secs(1));
+            assert!(
+                v.pos_sigma > 0.0,
+                "second {s}: uncertainty shown as zero: {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finite_frame_outside_the_domain_is_refused() {
+        // Audit regression. Every field of this frame is finite, and its origin is 1e200 m
+        // above the ellipsoid; a valid contact at the ellipsoid then stored an Up
+        // coordinate of -1e200.
+        let mut store = TrackStore::new(4.0, 900.0, 5.0);
+        let at = Instant::now();
+        for site in [
+            Geodetic {
+                lat_deg: 0.0,
+                lon_deg: 0.0,
+                alt_m: 1e200,
+            },
+            Geodetic {
+                lat_deg: 1e10,
+                lon_deg: 0.0,
+                alt_m: 0.0,
+            },
+            Geodetic {
+                lat_deg: 0.0,
+                lon_deg: -540.0,
+                alt_m: 0.0,
+            },
+        ] {
+            let report = store.ingest(&[contact("a", 0.0, 0.0, 0.0)], &Frame::new(site), at);
+            assert_eq!(report.invalid, 1, "{site:?}: {report:?}");
+        }
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_contact_outside_the_domain_is_refused_and_counted() {
+        // Direct callers of `ingest`, which never pass through a decoder.
+        let mut store = TrackStore::new(4.0, 900.0, 5.0);
+        let f = frame();
+        let now = Instant::now();
+        let report = store.ingest(
+            &[
+                contact("lat", 1e300, 23.7, 10_000.0),
+                contact("alt", 38.0, 23.7, 1e12),
+                aged("age", 38.0, 23.7, 10_000.0, -5.0),
+                aged("nan", 38.0, 23.7, 10_000.0, f64::NAN),
+            ],
+            &f,
+            now,
+        );
+        assert_eq!(report.invalid, 4);
+        assert_eq!(report.initiated, 0);
+        assert!(store.is_empty());
+        assert_eq!(store.total_invalid, 4);
+    }
+
+    #[test]
+    fn a_broken_frame_cannot_reach_the_filter() {
+        // `Frame` is public, and a frame built on a NaN site turns every valid contact
+        // into a NaN position after the contact check has passed. The frame check refuses
+        // it at the door, on young and firm tracks alike, and the refused plot must leave
+        // the track exactly as it was.
+        let mut store = TrackStore::new(4.0, 900.0, 5.0);
+        let good = frame();
+        let broken = Frame::new(Geodetic {
+            lat_deg: f64::NAN,
+            lon_deg: 23.7275,
+            alt_m: 0.0,
+        });
+        let start = Instant::now();
+        for step in 0..10 {
+            store.ingest(
+                &[contact("firm", 38.0, 23.7, 10_000.0)],
+                &good,
+                start + Duration::from_secs(step),
+            );
+        }
+        store.ingest(&[contact("young", 38.1, 23.7, 10_000.0)], &good, start);
+
+        let before: Vec<Track> = ["firm", "young"]
+            .iter()
+            .map(|id| store.get(id).unwrap().clone())
+            .collect();
+        let at = start + Duration::from_secs(11);
+        let report = store.ingest(
+            &[
+                contact("firm", 38.0, 23.7, 10_000.0),
+                contact("young", 38.1, 23.7, 10_000.0),
+                contact("fresh", 38.2, 23.7, 10_000.0),
+            ],
+            &broken,
+            at,
+        );
+        assert_eq!(report.invalid, 3, "{report:?}");
+        assert!(store.get("fresh").is_none());
+        for old in before {
+            let now = store.get(&old.id).unwrap();
+            assert_eq!(now.position(), old.position(), "{}", old.id);
+            assert_eq!(now.rejected, old.rejected, "{}: counted as gated", old.id);
+            assert_eq!(
+                now.filter_age_at(at),
+                old.filter_age_at(at),
+                "{}: coasted",
+                old.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_position_that_reaches_the_filter_is_refused() {
+        // The innovation check, tested directly. With contacts and frames both checked at
+        // the door, no public path hands `update` a non-finite position today; this guard
+        // is what holds if one ever does, and it must hold on young and firm tracks alike
+        // rather than relying on the gate, which asks a question NaN always answers "no" to.
+        let f = frame();
+        let at = Instant::now();
+        let c = contact("t", 38.0, 23.7, 10_000.0);
+        let mut young = Track::new(&c, f.to_enu(c.geo), at, 4.0, 900.0).unwrap();
+        let mut firm = young.clone();
+        firm.updates = 10;
+        for track in [&mut young, &mut firm] {
+            let before = format!("{track:?}");
+            for bad in [f64::NAN, f64::INFINITY] {
+                let pos = Enu {
+                    e: bad,
+                    n: 0.0,
+                    u: 0.0,
+                };
+                let outcome = track.update(&c, pos, at + Duration::from_secs(1), 5.0);
+                assert_eq!(outcome, Outcome::Invalid, "{bad}");
+                assert_eq!(format!("{track:?}"), before, "{bad}: the track changed");
+            }
+        }
+    }
+
+    #[test]
+    fn a_velocity_no_object_can_have_is_never_kept() {
+        // A measurement variance of 1e-300 m² is inside the tuning domain, and a time
+        // step of 1e-150 s is what two ages 1e-150 s apart produce. Together they give
+        // a velocity gain near 1e150, and a 10 km residual becomes 1e154 m/s: finite, so
+        // no finiteness check refuses it, and enough to overflow the first long view.
+        let mut store = TrackStore::new(4.0, 1e-300, 5.0);
+        let f = frame();
+        let at = Instant::now();
+        store.ingest(&[aged("vvv", 38.0, 23.7, 10_000.0, 1e-150)], &f, at);
+        let report = store.ingest(&[aged("vvv", 38.09, 23.7, 10_000.0, 0.0)], &f, at);
+        assert_eq!(report.invalid, 1, "{report:?}");
+        let v = store.get("vvv").unwrap().velocity();
+        assert!([v.e, v.n, v.u].iter().all(|x| x.abs() <= ENVELOPE), "{v:?}");
+    }
+
+    #[test]
+    fn an_unusable_optional_field_is_absent_not_fatal() {
+        // A report with a nonsense ground speed still has a good position: the speed is
+        // dropped, the track starts from a zero velocity prior, the position is kept.
+        let mut store = TrackStore::new(4.0, 900.0, 5.0);
+        let now = Instant::now();
+        let report = store.ingest(
+            &[Contact {
+                gs_kt: Some(1e308),
+                vrate_fpm: Some(f64::INFINITY),
+                ..contact("opt", 38.0, 23.7, 10_000.0)
+            }],
+            &frame(),
+            now,
+        );
+        assert_eq!(report.initiated, 1);
+        assert_eq!(store.get("opt").unwrap().velocity(), Enu::default());
+    }
+
+    #[test]
+    fn unusable_tuning_is_refused_at_construction() {
+        for (q, r, gate) in [
+            (f64::NAN, 900.0, 5.0),
+            (-1.0, 900.0, 5.0),
+            (4.0, 0.0, 5.0),
+            (0.0, 0.0, 5.0),
+            (4.0, -1.0, 5.0),
+            (4.0, 900.0, f64::NAN),
+            (4.0, 900.0, 0.0),
+            (4.0, 900.0, f64::INFINITY),
+            // Subnormal: not the value written, and a variance that small has no
+            // representable covariance.
+            (4.0, 5e-324, 5.0),
+            (1e-310, 900.0, 5.0),
+            (4.0, 900.0, 1e-320),
+        ] {
+            assert!(TrackStore::try_new(q, r, gate).is_err(), "{q} {r} {gate}");
+        }
+        assert!(
+            TrackStore::try_new(0.0, 900.0, 5.0).is_ok(),
+            "zero process noise is legitimate"
+        );
+        assert!(
+            TrackStore::try_new(f64::MIN_POSITIVE, f64::MIN_POSITIVE, f64::MIN_POSITIVE).is_ok(),
+            "the smallest normal double is inside the domain"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unusable filter tuning")]
+    fn new_panics_rather_than_building_a_store_with_a_disabled_gate() {
+        let _ = TrackStore::new(4.0, 900.0, f64::NAN);
     }
 
     #[test]

@@ -9,6 +9,8 @@
 //!     is undefined behaviour, so every entry point is panic-free by construction.
 //!   * no allocation crosses the boundary, so there is no question of which allocator
 //!     frees what.
+//!   * every input is checked against the declared numerical domain, and every result
+//!     is checked before it is written: success means four finite numbers.
 //!
 //! Matching C header:
 //!
@@ -16,15 +18,28 @@
 //! typedef struct { double e, n, u, ve, vn, vu; } aether_state_t;
 //! typedef struct { double t_cpa, horiz_m, vert_m, closing_ms; } aether_cpa_t;
 //!
+//! #define AETHER_OK         0
+//! #define AETHER_ERR_NULL  -1  /* a pointer was null */
+//! #define AETHER_ERR_NAN   -2  /* an input or the horizon was NaN, infinite or negative */
+//! #define AETHER_ERR_RANGE -3  /* a finite input exceeded 1e9 in magnitude, or the
+//!                                 result could not be represented */
+//!
 //! int aether_cpa(const aether_state_t *a, const aether_state_t *b,
 //!                double horizon_s, aether_cpa_t *out);
 //! ```
 
+use crate::conjunction::closest_approach_s;
+use crate::domain::{within, ENVELOPE};
+use crate::geo::Enu;
 use std::os::raw::c_int;
 
 pub const AETHER_OK: c_int = 0;
 pub const AETHER_ERR_NULL: c_int = -1;
 pub const AETHER_ERR_NAN: c_int = -2;
+/// A finite input outside the declared envelope (|x| > 1e9, SI units), or a result that
+/// could not be represented. Distinct from `AETHER_ERR_NAN` so a caller can tell a
+/// corrupted value from an out-of-range one.
+pub const AETHER_ERR_RANGE: c_int = -3;
 
 /// Position and velocity in a local ENU frame, metres and metres per second.
 #[repr(C)]
@@ -75,40 +90,63 @@ pub unsafe extern "C" fn aether_cpa(
         return AETHER_ERR_NAN;
     }
 
-    let result = match cpa(a, b, horizon_s) {
-        Some(r) => r,
-        None => return AETHER_ERR_NAN,
-    };
-    out.write(result);
-    AETHER_OK
+    match cpa(a, b, horizon_s) {
+        Ok(result) => {
+            out.write(result);
+            AETHER_OK
+        }
+        Err(code) => code,
+    }
 }
 
-/// The same closed-form closest approach that `conjunction::pair_cpa` reports, on bare
-/// states. Kept as safe Rust so it can be unit tested without any unsafe block in the
-/// test.
-fn cpa(a: &AetherState, b: &AetherState, horizon_s: f64) -> Option<AetherCpa> {
-    let (dpe, dpn, dpu) = (a.e - b.e, a.n - b.n, a.u - b.u);
-    let (dve, dvn, dvu) = (a.ve - b.ve, a.vn - b.vn, a.vu - b.vu);
-
-    let fields = [dpe, dpn, dpu, dve, dvn, dvu];
-    if fields.iter().any(|v| !v.is_finite()) {
-        return None;
+/// The same closest approach that `conjunction::pair_cpa` reports, through the same
+/// function, on bare states. Kept as safe Rust so it can be unit tested without any
+/// unsafe block in the test.
+///
+/// Checking only that the inputs are finite is not enough: two finite states of order
+/// 1e200 overflow the squared velocity, and the time of closest approach becomes NaN. So
+/// every input is held to the envelope first, which makes overflow unreachable, and the
+/// result is checked as well, so that success can only ever carry finite numbers.
+fn cpa(a: &AetherState, b: &AetherState, horizon_s: f64) -> Result<AetherCpa, c_int> {
+    let inputs = [
+        a.e, a.n, a.u, a.ve, a.vn, a.vu, b.e, b.n, b.u, b.ve, b.vn, b.vu,
+    ];
+    if inputs.iter().any(|v| !v.is_finite()) {
+        return Err(AETHER_ERR_NAN);
+    }
+    if !inputs.iter().all(|&v| within(v, -ENVELOPE, ENVELOPE)) {
+        return Err(AETHER_ERR_RANGE);
     }
 
-    let dvv = dve * dve + dvn * dvn + dvu * dvu;
-    let t = if dvv < 1e-9 {
-        0.0
-    } else {
-        (-(dpe * dve + dpn * dvn + dpu * dvu) / dvv).clamp(0.0, horizon_s)
+    let dp = Enu {
+        e: a.e - b.e,
+        n: a.n - b.n,
+        u: a.u - b.u,
     };
-
-    let (e, n, u) = (dpe + dve * t, dpn + dvn * t, dpu + dvu * t);
-    Some(AetherCpa {
+    let dv = Enu {
+        e: a.ve - b.ve,
+        n: a.vn - b.vn,
+        u: a.vu - b.vu,
+    };
+    let t = closest_approach_s(dp, dv, horizon_s);
+    let at = dp + dv * t;
+    let result = AetherCpa {
         t_cpa: t,
-        horiz_m: e.hypot(n),
-        vert_m: u.abs(),
-        closing_ms: (dve * dve + dvn * dvn + dvu * dvu).sqrt(),
-    })
+        horiz_m: at.horiz(),
+        vert_m: at.u.abs(),
+        closing_ms: dv.e.hypot(dv.n).hypot(dv.u),
+    };
+    let fields = [
+        result.t_cpa,
+        result.horiz_m,
+        result.vert_m,
+        result.closing_ms,
+    ];
+    if fields.iter().all(|v| v.is_finite()) {
+        Ok(result)
+    } else {
+        Err(AETHER_ERR_RANGE)
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +239,146 @@ mod tests {
         }
         // out must be untouched on the error path.
         assert_eq!(out.t_cpa, 0.0);
+    }
+
+    /// Output pre-filled with a bit pattern no computation produces, so "untouched" can
+    /// be checked exactly rather than by value.
+    fn sentinel() -> AetherCpa {
+        let s = f64::from_bits(0x7ff4_dead_beef_0001);
+        AetherCpa {
+            t_cpa: s,
+            horiz_m: s,
+            vert_m: s,
+            closing_ms: s,
+        }
+    }
+
+    fn untouched(out: &AetherCpa) -> bool {
+        let s = sentinel();
+        [out.t_cpa, out.horiz_m, out.vert_m, out.closing_ms]
+            .iter()
+            .zip([s.t_cpa, s.horiz_m, s.vert_m, s.closing_ms])
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+
+    #[test]
+    fn finite_inputs_that_overflow_are_refused_and_leave_output_untouched() {
+        // Audit regression. Every component is finite, so the input check passed; the
+        // squared velocity and the dot product overflow, time becomes NaN, and the old
+        // entry point wrote that and returned success.
+        let a = state(1e200, 0.0, 0.0, -1e200, 0.0, 0.0);
+        let b = state(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut out = sentinel();
+        let rc = unsafe { aether_cpa(&a, &b, 300.0, &mut out) };
+        assert_ne!(
+            rc, AETHER_OK,
+            "overflowing arithmetic reported success: {out:?}"
+        );
+        assert_eq!(rc, AETHER_ERR_RANGE);
+        assert!(
+            untouched(&out),
+            "an error path wrote to the caller: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_very_slow_approach_is_not_reported_as_already_closest() {
+        // Audit regression. 1 m apart, closing at 1e-5 m/s, over a 100,000 s horizon: the
+        // closest approach is at 100,000 s and 0 m. A threshold that treated any squared
+        // speed under 1e-9 as parallel reported t = 0 and 1 m instead.
+        let a = state(1.0, 0.0, 0.0, -1e-5, 0.0, 0.0);
+        let b = state(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let r = cpa(&a, &b, 100_000.0).unwrap();
+        assert!((r.t_cpa - 100_000.0).abs() < 1e-6, "{r:?}");
+        assert!(r.horiz_m < 1e-9, "{r:?}");
+
+        // Neighbouring scales: speeds from 1e-3 down to 1e-12 m/s, each over the horizon
+        // it takes to close 1 m, against a direct evaluation of the same instant.
+        for k in 3..=12 {
+            let speed = 10f64.powi(-k);
+            let horizon = 1.0 / speed;
+            let a = state(1.0, 0.0, 0.0, -speed, 0.0, 0.0);
+            let r = cpa(&a, &b, horizon).unwrap();
+            assert!(
+                (r.t_cpa / horizon - 1.0).abs() < 1e-9 && r.horiz_m < 1e-6,
+                "speed {speed}: {r:?}"
+            );
+            assert!(
+                (r.closing_ms / speed - 1.0).abs() < 1e-12,
+                "speed {speed}: {r:?}"
+            );
+        }
+        // One geometry at every scale the envelope admits: s metres apart, closing at s
+        // metres per second, meets after 1 s. Below about 1e-154 the squares of s
+        // underflow, and a quotient formed from them is 0/0.
+        for s in [1e-100, 1e-160, 1e-200, 1e-300, f64::MIN_POSITIVE, 5e-324] {
+            let r = cpa(&state(s, 0.0, 0.0, -s, 0.0, 0.0), &b, 10.0).unwrap();
+            assert!(
+                r.t_cpa == 1.0 && r.horiz_m == 0.0 && r.closing_ms == s,
+                "scale {s}: {r:?}"
+            );
+        }
+        // Exactly equal velocities have no closest approach later than now.
+        let still = cpa(&b, &state(3.0, 4.0, 0.0, 0.0, 0.0, 0.0), 1e9).unwrap();
+        assert_eq!((still.t_cpa, still.horiz_m), (0.0, 5.0));
+    }
+
+    #[test]
+    fn inputs_at_the_edge_of_the_envelope_still_succeed() {
+        // The envelope refuses what cannot be real, not what is merely large: two states
+        // a billion metres apart, closing at a billion metres per second, are computed.
+        let a = state(1e9, -1e9, 1e9, -1e9, 1e9, -1e9);
+        let b = state(-1e9, 1e9, -1e9, 1e9, -1e9, 1e9);
+        let mut out = sentinel();
+        let rc = unsafe { aether_cpa(&a, &b, 300.0, &mut out) };
+        assert_eq!(rc, AETHER_OK);
+        assert!(
+            out.t_cpa.is_finite() && out.closing_ms.is_finite(),
+            "{out:?}"
+        );
+        let over = state(1.000_000_1e9, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(
+            unsafe { aether_cpa(&over, &b, 300.0, &mut out) },
+            AETHER_ERR_RANGE
+        );
+    }
+
+    #[test]
+    fn every_call_either_succeeds_finitely_or_fails_without_writing() {
+        // The property across magnitudes: ordinary, large, and at the edge of overflow,
+        // in every field and with every sign, over ordinary and absurd horizons.
+        let mags = [
+            0.0, 1.0, 250.0, 1e7, 1e9, 1e12, 1e100, 1e154, 1e155, 1e200, 1e308,
+        ];
+        let horizons = [0.0, 300.0, 1e9, 1e300, f64::MAX];
+        let mut calls = 0;
+        for (i, &m) in mags.iter().enumerate() {
+            for field in 0..6 {
+                for sign in [1.0, -1.0] {
+                    for &h in &horizons {
+                        let mut v = [100.0, -2_000.0, 30.0, -150.0, 80.0, 5.0];
+                        v[field] = sign * m;
+                        // A second large field, so products of two large numbers occur.
+                        v[(field + 3) % 6] = -sign * mags[(i + 3) % mags.len()];
+                        let a = state(v[0], v[1], v[2], v[3], v[4], v[5]);
+                        let b = state(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                        let mut out = sentinel();
+                        let rc = unsafe { aether_cpa(&a, &b, h, &mut out) };
+                        calls += 1;
+                        if rc == AETHER_OK {
+                            let all = [out.t_cpa, out.horiz_m, out.vert_m, out.closing_ms];
+                            assert!(
+                                all.iter().all(|x| x.is_finite()),
+                                "success with a non-finite result for {v:?}, horizon {h}: {out:?}"
+                            );
+                        } else {
+                            assert!(untouched(&out), "error {rc} wrote for {v:?}: {out:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(calls > 600);
     }
 
     #[test]

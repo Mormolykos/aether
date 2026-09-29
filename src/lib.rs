@@ -12,6 +12,7 @@
 pub mod config;
 pub mod conjunction;
 pub mod domain;
+pub mod embodied;
 pub mod ffi;
 pub mod geo;
 pub mod ingest;
